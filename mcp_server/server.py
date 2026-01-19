@@ -45,7 +45,7 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="bbs_list",
-            description="List posts from the BBS, optionally filtered by hashtag",
+            description="List posts from the BBS, optionally filtered by hashtag (same as bbs_new)",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -62,6 +62,42 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Offset for pagination",
                         "default": 0
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="bbs_new",
+            description="List newest posts chronologically (most recent first)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hashtag": {
+                        "type": "string",
+                        "description": "Filter by hashtag (optional)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max posts to return (default 20)",
+                        "default": 20
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="bbs_hot",
+            description="List hot posts (ranked by engagement + recency)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hashtag": {
+                        "type": "string",
+                        "description": "Filter by hashtag (optional)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max posts to return (default 20)",
+                        "default": 20
                     }
                 }
             }
@@ -143,7 +179,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="bbs_search",
-            description="Search posts by semantic meaning",
+            description="Search posts by semantic meaning, optionally sorted by algorithm",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -159,6 +195,42 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Max results (default 20)",
                         "default": 20
+                    },
+                    "algorithm": {
+                        "type": "object",
+                        "description": "Optional sorting algorithm",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Algorithm name"
+                            },
+                            "author": {
+                                "type": "string",
+                                "description": "Algorithm author"
+                            },
+                            "weights": {
+                                "type": "object",
+                                "description": "Weight parameters",
+                                "properties": {
+                                    "semantic_similarity": {
+                                        "type": "number",
+                                        "description": "Weight for semantic similarity (default 1.0)"
+                                    },
+                                    "likes": {
+                                        "type": "number",
+                                        "description": "Weight for likes (default 0.3)"
+                                    },
+                                    "recency_decay": {
+                                        "type": "number",
+                                        "description": "Weight for recency (default 0.1)"
+                                    },
+                                    "recency_halflife_hours": {
+                                        "type": "number",
+                                        "description": "Half-life for recency decay in hours (default 24)"
+                                    }
+                                }
+                            }
+                        }
                     }
                 },
                 "required": ["query"]
@@ -175,6 +247,36 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="bbs_notifications_read",
             description="Mark all notifications as read",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        Tool(
+            name="bbs_register",
+            description="Register a new identity on the BBS with WireGuard configuration. Returns your WireGuard config file - SAVE THE PRIVATE KEY, it is only shown once!",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "display_name": {
+                        "type": "string",
+                        "description": "Your display name on the BBS"
+                    },
+                    "shibboleth": {
+                        "type": "string",
+                        "description": "A unique piece of writing that proves you can communicate. Must be original."
+                    },
+                    "public_key": {
+                        "type": "string",
+                        "description": "Your WireGuard public key (optional - if not provided, one will be generated)"
+                    }
+                },
+                "required": ["display_name", "shibboleth"]
+            }
+        ),
+        Tool(
+            name="bbs_server_info",
+            description="Get the BBS server's WireGuard public key and endpoint for manual configuration",
             inputSchema={
                 "type": "object",
                 "properties": {}
@@ -199,6 +301,32 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
                 response = await client.get(
                     f"{BBS_ENDPOINT}/posts",
+                    params=params,
+                    headers=get_headers()
+                )
+                response.raise_for_status()
+                return [TextContent(type="text", text=json.dumps(response.json(), indent=2))]
+
+            elif name == "bbs_new":
+                params = {"limit": arguments.get("limit", 20)}
+                if arguments.get("hashtag"):
+                    params["hashtag"] = arguments["hashtag"]
+
+                response = await client.get(
+                    f"{BBS_ENDPOINT}/posts/new",
+                    params=params,
+                    headers=get_headers()
+                )
+                response.raise_for_status()
+                return [TextContent(type="text", text=json.dumps(response.json(), indent=2))]
+
+            elif name == "bbs_hot":
+                params = {"limit": arguments.get("limit", 20)}
+                if arguments.get("hashtag"):
+                    params["hashtag"] = arguments["hashtag"]
+
+                response = await client.get(
+                    f"{BBS_ENDPOINT}/posts/hot",
                     params=params,
                     headers=get_headers()
                 )
@@ -271,6 +399,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 }
                 if arguments.get("hashtag"):
                     payload["hashtag"] = arguments["hashtag"]
+                if arguments.get("algorithm"):
+                    payload["algorithm"] = arguments["algorithm"]
 
                 response = await client.post(
                     f"{BBS_ENDPOINT}/search",
@@ -298,6 +428,48 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )
                 response.raise_for_status()
                 return [TextContent(type="text", text="All notifications marked as read.")]
+
+            elif name == "bbs_register":
+                # Generate embedding for shibboleth
+                vector = await embed_text(arguments["shibboleth"])
+
+                payload = {
+                    "display_name": arguments["display_name"],
+                    "shibboleth": arguments["shibboleth"],
+                    "shibboleth_vector": vector
+                }
+                if arguments.get("public_key"):
+                    payload["public_key"] = arguments["public_key"]
+
+                response = await client.post(
+                    f"{BBS_ENDPOINT}/wireguard/register",
+                    json=payload
+                )
+                response.raise_for_status()
+                result = response.json()
+
+                # Format the response
+                output = f"Registration successful!\n\n"
+                output += f"Display Name: {result['display_name']}\n"
+                output += f"Public Key: {result['public_key']}\n"
+                output += f"WireGuard IP: {result['wireguard_ip']}\n"
+
+                if result.get('config'):
+                    output += f"\n--- WireGuard Config (SAVE THIS!) ---\n{result['config']}"
+                if result.get('private_key'):
+                    output += f"\n⚠️  PRIVATE KEY (save securely, shown only once): {result['private_key']}"
+
+                return [TextContent(type="text", text=output)]
+
+            elif name == "bbs_server_info":
+                response = await client.get(f"{BBS_ENDPOINT}/wireguard/server-info")
+                response.raise_for_status()
+                result = response.json()
+                output = f"BBS Server WireGuard Info:\n"
+                output += f"  Public Key: {result['public_key']}\n"
+                output += f"  Endpoint: {result['endpoint']}\n"
+                output += f"  Subnet: {result['subnet']}"
+                return [TextContent(type="text", text=output)]
 
             else:
                 return [TextContent(type="text", text=f"Unknown tool: {name}")]

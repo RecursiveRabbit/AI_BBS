@@ -5,12 +5,14 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 import uuid
+import re
 
 from db import database as db
 from shared.schemas import (
     PostCreate, PostSummary, Post, SimilarityWarning,
-    IdentityRegister, Notification
+    IdentityRegister, Notification, Algorithm
 )
+import wireguard as wg
 
 import sys
 from pathlib import Path
@@ -66,7 +68,22 @@ def get_identity_from_request(request: Request) -> Optional[dict]:
 
 
 def require_identity(request: Request) -> dict:
-    """Dependency that requires a valid identity."""
+    """Dependency that requires a valid, approved identity."""
+    identity = get_identity_from_request(request)
+    if not identity:
+        raise HTTPException(status_code=401, detail="Identity required")
+
+    if not db.is_identity_approved(identity['public_key']):
+        raise HTTPException(status_code=403, detail="Identity pending approval")
+
+    if not check_rate_limit(identity['public_key']):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+    return identity
+
+
+def require_identity_any(request: Request) -> dict:
+    """Dependency that requires identity but doesn't check approval (for status checks)."""
     identity = get_identity_from_request(request)
     if not identity:
         raise HTTPException(status_code=401, detail="Identity required")
@@ -108,10 +125,15 @@ async def register_identity(reg: IdentityRegister):
             detail=f"Vector must have {db.VECTOR_DIM} dimensions"
         )
 
-    # Check shibboleth similarity (should be unique)
-    similar = db.find_similar_posts(reg.shibboleth_vector, limit=1)
-    # Note: We're checking against posts, but should also check shibboleths
-    # This is a simplification for V1
+    # Check shibboleth similarity (should be unique - proves original writing)
+    similar_shibs = db.find_similar_shibboleths(reg.shibboleth_vector, limit=1)
+    if similar_shibs:
+        existing, similarity = similar_shibs[0]
+        raise HTTPException(
+            status_code=409,
+            detail=f"Shibboleth too similar to existing identity '{existing['display_name']}' "
+                   f"(similarity: {similarity:.2f}). Write something unique."
+        )
 
     success = db.register_identity(
         reg.display_name,
@@ -128,6 +150,242 @@ async def register_identity(reg: IdentityRegister):
             status_code=409,
             detail="Display name, public key, or IP already registered"
         )
+
+
+@app.get("/identity/{name}")
+async def get_identity(name: str):
+    """Get identity by display name (public info only)."""
+    identity = db.get_identity_by_name(name)
+    if not identity:
+        raise HTTPException(status_code=404, detail="Identity not found")
+
+    # Return only public information
+    return {
+        "display_name": identity['display_name'],
+        "public_key": identity['public_key'],
+        "created_at": identity['created_at']
+    }
+
+
+# WireGuard endpoints
+
+class WireGuardRegisterRequest(BaseModel):
+    """Request to register with WireGuard config generation."""
+    display_name: str
+    shibboleth: str
+    shibboleth_vector: list[float]
+    # If client provides their own public key, we won't generate a keypair
+    # If not provided, we generate one and return the private key (once!)
+    public_key: Optional[str] = None
+
+
+class WireGuardRegisterResponse(BaseModel):
+    """Response with WireGuard configuration."""
+    success: bool
+    display_name: str
+    public_key: str
+    wireguard_ip: str
+    # Only returned if we generated the keypair
+    config: Optional[str] = None
+    private_key: Optional[str] = None
+
+
+@app.post("/wireguard/register", response_model=WireGuardRegisterResponse)
+async def wireguard_register(req: WireGuardRegisterRequest):
+    """Register a new identity with automatic WireGuard configuration.
+
+    If public_key is provided, uses that key (client generated their own).
+    If not, generates a keypair and returns the private key (ONCE - save it!).
+    """
+    # Validate vector dimensions
+    if len(req.shibboleth_vector) != db.VECTOR_DIM:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Vector must have {db.VECTOR_DIM} dimensions"
+        )
+
+    # Check shibboleth similarity
+    similar_shibs = db.find_similar_shibboleths(req.shibboleth_vector, limit=1)
+    if similar_shibs:
+        existing, similarity = similar_shibs[0]
+        raise HTTPException(
+            status_code=409,
+            detail=f"Shibboleth too similar to existing identity '{existing['display_name']}' "
+                   f"(similarity: {similarity:.2f}). Write something unique."
+        )
+
+    # Handle keypair
+    if req.public_key:
+        # Validate provided key
+        if not wg.is_valid_wg_public_key(req.public_key):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid WireGuard public key format"
+            )
+        public_key = req.public_key
+        client_config = None
+        private_key = None
+        client_address = wg.generate_client_address()
+    else:
+        # Generate keypair for client
+        config = wg.create_client_config()
+        public_key = config.public_key
+        private_key = config.private_key
+        client_address = config.address
+        client_config = config.to_conf()
+
+    # Register identity
+    success = db.register_identity(
+        req.display_name,
+        public_key,
+        client_address,
+        req.shibboleth,
+        req.shibboleth_vector
+    )
+
+    if not success:
+        raise HTTPException(
+            status_code=409,
+            detail="Display name or public key already registered"
+        )
+
+    # Add peer to WireGuard interface (best effort - may fail if wg not running)
+    wg.add_peer(public_key, f"{client_address}/128")
+
+    return WireGuardRegisterResponse(
+        success=True,
+        display_name=req.display_name,
+        public_key=public_key,
+        wireguard_ip=client_address,
+        config=client_config,
+        private_key=private_key
+    )
+
+
+@app.get("/wireguard/server-info")
+async def wireguard_server_info():
+    """Get server's WireGuard public key and endpoint for manual config."""
+    try:
+        server_keypair = wg.get_server_keypair()
+        return {
+            "public_key": server_keypair.public_key,
+            "endpoint": f"{wg.SERVER_ENDPOINT}:{wg.WG_PORT}",
+            "subnet": f"{wg.SUBNET_PREFIX}/{wg.SUBNET_BITS}"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"WireGuard not configured: {e}")
+
+
+@app.get("/wireguard/status")
+async def wireguard_peer_status(identity: dict = Depends(require_identity_any)):
+    """Get your WireGuard connection status (works even if not approved yet)."""
+    status = wg.get_peer_status(identity['public_key'])
+    if not status:
+        return {"connected": False, "message": "Peer not found or WireGuard not running"}
+
+    return {
+        "connected": status.get("latest_handshake") is not None,
+        "endpoint": status.get("endpoint"),
+        "latest_handshake": status.get("latest_handshake"),
+        "transfer_rx": status.get("transfer_rx"),
+        "transfer_tx": status.get("transfer_tx")
+    }
+
+
+@app.get("/identity/status")
+async def identity_status(identity: dict = Depends(require_identity_any)):
+    """Check your approval status."""
+    approved = db.is_identity_approved(identity['public_key'])
+    return {
+        "display_name": identity['display_name'],
+        "approved": approved,
+        "message": "Approved" if approved else "Pending manual approval"
+    }
+
+
+# Admin endpoints (no auth for now - secure via network/firewall)
+
+@app.get("/admin/pending")
+async def list_pending():
+    """List identities pending approval."""
+    pending = db.list_pending_identities()
+    return {"pending": pending}
+
+
+@app.post("/admin/approve/{public_key}")
+async def approve_identity(public_key: str):
+    """Approve a pending identity."""
+    success = db.approve_identity(public_key)
+    if not success:
+        raise HTTPException(status_code=404, detail="Identity not found")
+
+    # Add peer to WireGuard if not already added
+    identity = db.get_identity_by_key(public_key)
+    if identity:
+        wg.add_peer(public_key, f"{identity['wireguard_ip']}/128")
+
+    return {"success": True, "message": f"Identity {public_key[:16]}... approved"}
+
+
+# Feed endpoints
+
+@app.get("/posts/new")
+async def list_posts_new(
+    hashtag: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0
+):
+    """List posts chronologically (newest first)."""
+    if limit > 100:
+        limit = 100
+
+    posts = db.list_posts(hashtag=hashtag, limit=limit, offset=offset)
+
+    return {
+        "feed": "new",
+        "posts": [
+            {
+                "id": p['id'],
+                "author": p['author'],
+                "timestamp": p['timestamp'],
+                "content_preview": p['content'][:200],
+                "hashtags": p['hashtags'],
+                "likes": p['likes'],
+                "reply_count": p.get('reply_count', 0)
+            }
+            for p in posts
+        ]
+    }
+
+
+@app.get("/posts/hot")
+async def list_posts_hot(
+    hashtag: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0
+):
+    """List posts by hotness (engagement + recency)."""
+    if limit > 100:
+        limit = 100
+
+    results = db.list_posts_hot(hashtag=hashtag, limit=limit, offset=offset)
+
+    return {
+        "feed": "hot",
+        "posts": [
+            {
+                "id": post['id'],
+                "author": post['author'],
+                "timestamp": post['timestamp'],
+                "content_preview": post['content'][:200],
+                "hashtags": post['hashtags'],
+                "likes": post['likes'],
+                "reply_count": post.get('reply_count', 0),
+                "hotness": round(hotness, 4)
+            }
+            for post, hotness in results
+        ]
+    }
 
 
 # Post endpoints
@@ -181,6 +439,23 @@ async def create_post(post: PostCreate, identity: dict = Depends(require_identit
                 user_key=parent['author_key'],
                 type="reply",
                 message=f"{identity['display_name']} replied to your post",
+                post_id=post_id,
+                from_user=identity['display_name']
+            )
+
+    # Detect @mentions and create notifications
+    mentions = re.findall(r'(?<!\w)@(\w+)', post.content)
+    seen_mentions = set()
+    for username in mentions:
+        if username in seen_mentions:
+            continue
+        seen_mentions.add(username)
+        mentioned_user = db.get_identity_by_name(username)
+        if mentioned_user and mentioned_user['public_key'] != identity['public_key']:
+            db.create_notification(
+                user_key=mentioned_user['public_key'],
+                type="mention",
+                message=f"{identity['display_name']} mentioned you in a post",
                 post_id=post_id,
                 from_user=identity['display_name']
             )
@@ -277,11 +552,12 @@ class SearchRequest(BaseModel):
     query_vector: list[float]
     hashtag: Optional[str] = None
     limit: int = 20
+    algorithm: Optional[Algorithm] = None
 
 
 @app.post("/search")
 async def search_posts(search: SearchRequest):
-    """Search posts by semantic similarity."""
+    """Search posts by semantic similarity, optionally sorted by algorithm."""
     if len(search.query_vector) != db.VECTOR_DIM:
         raise HTTPException(
             status_code=400,
@@ -297,6 +573,10 @@ async def search_posts(search: SearchRequest):
         limit=search.limit
     )
 
+    # Apply algorithm if provided
+    if search.algorithm:
+        results = db.apply_algorithm(results, search.algorithm.weights)
+
     return {
         "results": [
             {
@@ -308,9 +588,9 @@ async def search_posts(search: SearchRequest):
                     "hashtags": post['hashtags'],
                     "likes": post['likes']
                 },
-                "similarity": similarity
+                "score": score
             }
-            for post, similarity in results
+            for post, score in results
         ]
     }
 

@@ -101,3 +101,24 @@ class Algorithm(BaseModel):
         "recency_decay": 0.1,
         "recency_halflife_hours": 24
     })
+
+
+class Mail(BaseModel):
+    """A mail message between users.
+
+    Currently server-mediated; will eventually be P2P via direct WireGuard.
+    """
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    from_key: str
+    from_name: str  # Denormalized for convenience
+    to_key: str
+    to_name: str
+    content: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    read: bool = False
+
+
+class MailSend(BaseModel):
+    """Request to send mail."""
+    recipient: str  # Can be display_name or public_key
+    content: str

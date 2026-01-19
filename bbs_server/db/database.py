@@ -54,7 +54,8 @@ def init_db():
                 wireguard_ip TEXT UNIQUE NOT NULL,
                 created_at TEXT NOT NULL,
                 shibboleth TEXT NOT NULL,
-                shibboleth_vector BLOB NOT NULL
+                shibboleth_vector BLOB NOT NULL,
+                approved INTEGER DEFAULT 0  -- 0=pending, 1=approved
             );
 
             -- Posts table
@@ -96,11 +97,26 @@ def init_db():
                 FOREIGN KEY (user_key) REFERENCES identities(public_key)
             );
 
+            -- Mail table (server-mediated P2P mail stub)
+            CREATE TABLE IF NOT EXISTS mail (
+                id TEXT PRIMARY KEY,
+                from_key TEXT NOT NULL,
+                from_name TEXT NOT NULL,
+                to_key TEXT NOT NULL,
+                to_name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                read INTEGER DEFAULT 0,
+                FOREIGN KEY (from_key) REFERENCES identities(public_key),
+                FOREIGN KEY (to_key) REFERENCES identities(public_key)
+            );
+
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_posts_parent ON posts(parent_id);
             CREATE INDEX IF NOT EXISTS idx_posts_author ON posts(author_key);
             CREATE INDEX IF NOT EXISTS idx_posts_timestamp ON posts(timestamp);
             CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_key, read);
+            CREATE INDEX IF NOT EXISTS idx_mail_to ON mail(to_key, read);
         """)
         conn.commit()
 
@@ -156,6 +172,53 @@ def get_identity_by_name(display_name: str) -> Optional[dict]:
         if row:
             return dict(row)
         return None
+
+
+def find_similar_shibboleths(vector: list[float], limit: int = 5) -> list[tuple[dict, float]]:
+    """Find identities with similar shibboleths. Returns list of (identity, similarity)."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM identities").fetchall()
+
+        results = []
+        for row in rows:
+            identity = dict(row)
+            shib_vector = deserialize_vector(identity['shibboleth_vector'])
+            similarity = cosine_similarity(vector, shib_vector)
+            if similarity >= SIMILARITY_THRESHOLD:
+                results.append((identity, similarity))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:limit]
+
+
+def approve_identity(public_key: str) -> bool:
+    """Approve a pending identity. Returns True if successful."""
+    with get_db() as conn:
+        result = conn.execute(
+            "UPDATE identities SET approved = 1 WHERE public_key = ?",
+            (public_key,)
+        )
+        conn.commit()
+        return result.rowcount > 0
+
+
+def list_pending_identities() -> list[dict]:
+    """List all identities pending approval."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT public_key, display_name, created_at, shibboleth FROM identities WHERE approved = 0 ORDER BY created_at"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def is_identity_approved(public_key: str) -> bool:
+    """Check if an identity is approved."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT approved FROM identities WHERE public_key = ?",
+            (public_key,)
+        ).fetchone()
+        return bool(row and row['approved'])
 
 
 # Post operations
@@ -279,6 +342,63 @@ def search_posts(query_vector: list[float], hashtag: Optional[str] = None,
         return results[offset:offset + limit]
 
 
+def apply_algorithm(results: list[tuple[dict, float]], weights: dict[str, float]) -> list[tuple[dict, float]]:
+    """Apply algorithm weights to search results and re-sort.
+
+    Formula: score = semantic_similarity * w_semantic + normalized_likes * w_likes + recency_factor * w_recency
+    Where recency_factor = 0.5^(hours_since_post / halflife_hours)
+
+    Args:
+        results: List of (post, semantic_similarity) tuples
+        weights: Algorithm weights dict with keys:
+            - semantic_similarity: weight for semantic similarity (default 1.0)
+            - likes: weight for likes (default 0.3)
+            - recency_decay: weight for recency (default 0.1)
+            - recency_halflife_hours: half-life for recency decay (default 24)
+
+    Returns:
+        Re-sorted list of (post, final_score) tuples
+    """
+    if not results:
+        return results
+
+    # Get weights with defaults
+    w_semantic = weights.get("semantic_similarity", 1.0)
+    w_likes = weights.get("likes", 0.3)
+    w_recency = weights.get("recency_decay", 0.1)
+    halflife_hours = weights.get("recency_halflife_hours", 24)
+
+    # Find max likes for normalization (avoid division by zero)
+    max_likes = max((post['likes'] for post, _ in results), default=1)
+    if max_likes == 0:
+        max_likes = 1
+
+    now = datetime.utcnow()
+    scored_results = []
+
+    for post, similarity in results:
+        # Normalize likes to [0, 1]
+        normalized_likes = post['likes'] / max_likes
+
+        # Calculate recency factor: 0.5^(hours_since_post / halflife)
+        post_time = datetime.fromisoformat(post['timestamp'].replace('Z', '+00:00').replace('+00:00', ''))
+        hours_since_post = (now - post_time).total_seconds() / 3600
+        recency_factor = 0.5 ** (hours_since_post / halflife_hours) if halflife_hours > 0 else 1.0
+
+        # Calculate final score
+        score = (
+            similarity * w_semantic +
+            normalized_likes * w_likes +
+            recency_factor * w_recency
+        )
+
+        scored_results.append((post, score))
+
+    # Sort by score descending
+    scored_results.sort(key=lambda x: x[1], reverse=True)
+    return scored_results
+
+
 def list_posts(hashtag: Optional[str] = None, limit: int = 20,
                offset: int = 0) -> list[dict]:
     """List posts, optionally filtered by hashtag."""
@@ -309,6 +429,56 @@ def list_posts(hashtag: Optional[str] = None, limit: int = 20,
             post['reply_count'] = reply_count
             posts.append(post)
         return posts
+
+
+def list_posts_hot(hashtag: Optional[str] = None, limit: int = 20,
+                   offset: int = 0) -> list[tuple[dict, float]]:
+    """List posts sorted by hotness (engagement + recency).
+
+    Hotness formula: (likes + replies*2) / (hours_since_post + 2)^1.5
+    This gives recent posts with engagement a boost, older posts decay.
+    """
+    with get_db() as conn:
+        if hashtag:
+            rows = conn.execute(
+                """SELECT * FROM posts WHERE hashtags LIKE ? AND parent_id IS NULL""",
+                (f'%"{hashtag}"%',)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM posts WHERE parent_id IS NULL"""
+            ).fetchall()
+
+        now = datetime.utcnow()
+        scored_posts = []
+
+        for row in rows:
+            post = dict(row)
+            post['vector'] = deserialize_vector(post['vector'])
+            post['hashtags'] = json.loads(post['hashtags'])
+            post['appends'] = json.loads(post['appends'])
+
+            # Count replies
+            reply_count = conn.execute(
+                "SELECT COUNT(*) FROM posts WHERE parent_id = ?", (post['id'],)
+            ).fetchone()[0]
+            post['reply_count'] = reply_count
+
+            # Calculate hotness
+            post_time = datetime.fromisoformat(post['timestamp'].replace('Z', ''))
+            hours_since = max((now - post_time).total_seconds() / 3600, 0.1)
+
+            # Engagement: likes + replies weighted more heavily
+            engagement = post['likes'] + (reply_count * 2)
+
+            # Hotness decays with time^1.5, +2 to avoid division issues for new posts
+            hotness = engagement / ((hours_since + 2) ** 1.5)
+
+            scored_posts.append((post, hotness))
+
+        # Sort by hotness descending
+        scored_posts.sort(key=lambda x: x[1], reverse=True)
+        return scored_posts[offset:offset + limit]
 
 
 # Like operations
@@ -382,6 +552,55 @@ def mark_notifications_read(user_key: str):
             (user_key,)
         )
         conn.commit()
+
+
+# Mail operations (server-mediated P2P stub)
+
+def send_mail(from_key: str, from_name: str, to_key: str, to_name: str, content: str) -> str:
+    """Send mail to another user. Returns mail ID."""
+    import uuid
+    mail_id = str(uuid.uuid4())
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO mail
+               (id, from_key, from_name, to_key, to_name, content, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (mail_id, from_key, from_name, to_key, to_name, content,
+             datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        return mail_id
+
+
+def get_mail(user_key: str, unread_only: bool = True) -> list[dict]:
+    """Get mail for a user."""
+    with get_db() as conn:
+        if unread_only:
+            rows = conn.execute(
+                """SELECT * FROM mail
+                   WHERE to_key = ? AND read = 0
+                   ORDER BY timestamp DESC""",
+                (user_key,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM mail
+                   WHERE to_key = ?
+                   ORDER BY timestamp DESC LIMIT 100""",
+                (user_key,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def mark_mail_read(mail_id: str, user_key: str) -> bool:
+    """Mark a mail as read. Returns True if successful."""
+    with get_db() as conn:
+        result = conn.execute(
+            "UPDATE mail SET read = 1 WHERE id = ? AND to_key = ?",
+            (mail_id, user_key)
+        )
+        conn.commit()
+        return result.rowcount > 0
 
 
 # Initialize on import
