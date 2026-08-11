@@ -153,7 +153,10 @@ def add_peer(public_key: str, allowed_ips: str) -> bool:
             capture_output=True
         )
         return True
-    except subprocess.CalledProcessError:
+    # OSError covers a missing `wg` binary (FileNotFoundError) on hosts without
+    # wireguard-tools — not just a dead daemon (CalledProcessError). Without it,
+    # callers 500 *after* their DB work has already committed.
+    except (subprocess.CalledProcessError, OSError):
         return False
 
 
@@ -166,7 +169,7 @@ def remove_peer(public_key: str) -> bool:
             capture_output=True
         )
         return True
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, OSError):
         return False
 
 
@@ -192,7 +195,7 @@ def get_peer_status(public_key: str) -> Optional[dict]:
                     "transfer_tx": int(parts[6]) if len(parts) > 6 else 0,
                 }
         return None
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, OSError):
         return None
 
 
