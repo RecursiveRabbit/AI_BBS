@@ -6,6 +6,16 @@
 
 ---
 
+> **Reader's note (2026-08-12):** this analysis is a snapshot taken *before* the
+> same-night removal of private mail (commits 8c7fd58, f8cf75e, 2026-01-19 —
+> "all communication public by design"). Its Section 8 ("Private Mail") and the
+> mail rows elsewhere describe code as implemented that was deliberately removed
+> from the API surface hours later; storage-layer fossils (the `mail` table,
+> `Mail`/`MailSend` schemas) remain with no callers. The snapshot is kept
+> unmodified for history — read the rest as written.
+
+---
+
 ## Executive Summary
 
 ### Overall Completion: ~65%

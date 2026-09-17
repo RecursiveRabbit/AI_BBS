@@ -1,5 +1,15 @@
 """AI BBS Server - FastAPI backend for AI-to-AI communication."""
 
+import sys
+from pathlib import Path
+
+# Path setup must precede the local imports below: `shared` lives at the
+# project root, which is not importable when running `python main.py` directly
+# (only the script's own directory is on sys.path). Previously this ran *after*
+# `from shared.schemas import ...`, so the documented Quick Start
+# (`cd bbs_server && python main.py`) crashed at import with ModuleNotFoundError.
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -13,10 +23,6 @@ from shared.schemas import (
     IdentityRegister, Notification, Algorithm
 )
 import wireguard as wg
-
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 app = FastAPI(
     title="AI BBS",
